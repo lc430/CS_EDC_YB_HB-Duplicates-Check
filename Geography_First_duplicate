@@ -1,0 +1,190 @@
+import pandas as pd
+import affine
+from py2neo import Graph
+import sys
+from py2neo.matching import *
+import editdistance
+from py_stringmatching.similarity_measure import *
+import math
+import dimsim
+import itertools
+import re
+
+EDITDISTANCE_THRESHOLD = 0.30       # want to be less than this
+AFFINE_THRESHOLD = 0.75             # want to be greater than this
+CHINESE_PHONETIC_THRESHOLD = 12     # want to be less than this
+
+def read_and_split_csv(file_path, delimiter='@'):
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+    data = [line.strip().split(delimiter) for line in lines]
+
+    df = pd.DataFrame(data[1:], columns=data[0])
+    return df
+
+def extract_geography_relationships(rels):
+    geo_rels = rels[rels[':TYPE']] == 'LOCATED_IN'
+    return geo_rels
+
+def match_nodes_by_geography(geo_rels_1, geo_rels_2):
+    common_geo_rels = pd.merge(geo_rels_1, geo_rels_2, on=':END_ID', suffixes=('_1','_2'))
+    return common_geo_rels[[':START_ID_1',':START_ID_2']]
+
+
+
+def is_valid_pinyin_or_chinese(name):
+    if not isinstance(name, str):
+        return False
+    for char in name:
+        if not ('\u4e00' <= char <= '\u9fff' or 'a' <= char.lower() <= 'z' or char in "āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜü"):
+            return False
+    return True
+
+def compare_two_names_chinese(name1, name2):
+    if not is_valid_pinyin_or_chinese(name1) or not is_valid_pinyin_or_chinese(name2):
+        print(f"Invalid Pinyin or Chinese characters: '{name1}' or '{name2}'")
+        return False
+    if len(name1) == len(name2) and len(name2) > 0:
+        hz_sim_score = dimsim.get_distance(name1, name2)   
+        return hz_sim_score < CHINESE_PHONETIC_THRESHOLD
+    return False
+
+def compare_two_names_western(name1, name2):
+    aff = affine.Affine()
+    if len(name1) == 0 or len(name2) == 0:
+        return False
+    ed_score = 2.0 * editdistance.eval(name1, name2) / (len(name1) + len(name2))
+    aff_score = aff.get_raw_score(name1, name2) / min(len(name1), len(name2))
+    return (ed_score < EDITDISTANCE_THRESHOLD) or (aff_score > AFFINE_THRESHOLD)
+
+def compare_two_inst_entries(entry1, entry2):
+    x = entry1["chinese_name_hanzi"]
+    x = "".join(re.findall(r'[\u4e00-\u9fff]+', x))
+    y = entry2["chinese_name_hanzi"]
+    if x is None or y is None:
+        result1 = False
+    else:
+        result1 = compare_two_names_chinese(x, y)
+    
+    x = entry1["name_western"]
+    y = entry2["name_western"]
+    if x is None or y is None:
+        result2 = False
+    else:
+        result2 = compare_two_names_western(x, y)
+
+    other_similars = ["christian_tradition", "gender_served", "alternative_name_western", "nationality", "religious_family", "start_day", "start_month", "start_year", "end_day", "end_year", "end_month"]
+    result3 = False
+    for s in other_similars:
+        x = entry1[s]
+        y = entry2[s]
+        if x == y:
+            result3 = True
+            break
+        else:
+            continue
+    return ((result1 or result2) and (result3 == True))
+
+
+def detect_duplicate_geo_relationships(common_geo_nodes, nodes_1, nodes_2, rels_1, rels_2):
+    duplicate = []
+    for index, row in common_geo_nodes.iterrows():
+        node_1_id = row[':START_ID_1']
+        node_2_id = row[':STARR_ID_2']
+
+        node_1_info = nodes_1[nodes_1['id'] == node_1_id].iloc[0]
+        node_2_info = nodes_2[nodes_2['id'] == node_2_id].iloc[0]
+        
+        if compare_two_inst_entries(node_1_info, node_2_info):
+            rels_1_filtered = rels_1[(rels_1[':START_ID'] == node_1_id) | (rels_1[':END_ID'] == node_1_id)]
+            rels_2_filtered = rels_2[(rels_2[':START_ID'] == node_2_id) | (rels_2[':END_ID'] == node_2_id)]
+
+            if not rels_1_filtered.empty and not rels_2_filtered.empty:
+                common_rels = pd.merge(rels_1_filtered, rels_2_filtered, on=[':START_ID', ':END_ID'], suffixes=('_1', '_2'))
+                if not common_rels.empty:
+                    duplicate.append({'duplicate_id': node_2_id, 'original_id': node_1_id})
+    return duplicate
+
+def save_results(duplicates, output_file):
+    duplicates_df = pd.DataFrame(duplicates)
+    duplicates_df.to_csv(output_file, index = False)
+    print(f"results saved to {output_file}")
+
+def main():
+    file_path1 = 'chcd_v2.2_nodes.csv'
+    file_path2 = 'chcd_v2.2_edges.csv'
+    file_path3 = 'CS_EDC_YB_HB_nodes.csv'
+    file_path4 = 'CS_EDC_YB_HB_rels.csv'
+
+    nodes1 = read_and_split_csv(file_path1)
+    rels1 = read_and_split_csv(file_path2)
+    nodes2 = pd.read_csv(file_path3)
+    rels2 = pd.read_csv(file_path4)
+
+    output_file = 'duplicates.csv'
+
+    geo_rels_1 = extract_geography_relationships(rels1)
+    geo_rels_2 = extract_geography_relationships(rels2)
+    
+    common_geo_nodes = match_nodes_by_geography(geo_rels_1, geo_rels_2)
+    duplicates = detect_duplicate_geo_relationships(common_geo_nodes, nodes1, nodes2, rels1, rels2)
+    
+    save_results(duplicates, output_file)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+#df1 = pd.concat([dfn1, dfn2], ignore_index=True)
+#df2 = pd.concat([dfr1, dfr2], ignore_index=True)
+
+#area_related = get_related_nodes('GeneralArea', df2)
+#dfa = pd.DataFrame(area_related)
+#duplicate_geo = dfa.groupby('GeneralArea').filter(lambda x: len(x) > 1)
+#duplicate_id = duplicate_geo.groupby('GeneralArea')['id'].apply(list).reset_index()
+
+#print(duplicate_id)
+
+'''
+def get_start_id(end_id, df):
+    if ':END_ID' in df.columns:
+        row = df[df[':START_ID'] == end_id] 
+        if not row.empty:
+            return row[':START_ID'].tolist()
+        else:
+            return None
+    elif 'TEMP_ID_2' in df.columns:
+        row = df[df['TEMP_ID_2'] == end_id] 
+        if not row.empty:
+            return row['TEMP_ID_1'].tolist()
+        else:
+            return None
+
+def get_end_id(start_id, df):
+    if ':START_ID' in df.columns:
+        row = df[df[':START_ID'] == start_id] 
+        if not row.empty:
+            return row['END_ID'].tolist()
+        else:
+            return None
+    elif 'TEMP_ID_1' in df.columns:
+        row = df[df['TEMP_ID_1'] == start_id] 
+        if not row.empty:
+            return row['TEMP_ID_2'].tolist()
+        else:
+            return None
+        
+def get_related_nodes(related_nodes, df):
+    nodes = df[df['TYPE'] == related_nodes]
+    related_nodes = {}
+    for index, row in nodes.iterrows():
+        start_id = row['START_ID']
+        related_rows = df[df['START_ID'] == start_id]
+        related_nodes[start_id] = related_rows['END_ID'].tolist()
+    return related_nodes
+'''
